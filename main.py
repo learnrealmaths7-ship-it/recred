@@ -22,24 +22,50 @@ Endpoints:
 import os
 import sqlite3
 import secrets
+import threading
 import time
 from flask import Flask, request, jsonify, render_template_string, abort, redirect
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 
-# Use /tmp on Railway (writable). Fall back to local file for dev.
-DB_PATH = os.environ.get("DB_PATH", "/tmp/recred.db")
+# Use /tmp on Railway unless DB_PATH or a Railway volume mount is provided.
+# Local Windows runs use a file next to this app because C:\tmp is often locked.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.environ.get("DB_PATH"):
+    DB_PATH = os.environ["DB_PATH"]
+elif os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"):
+    DB_PATH = os.path.join(os.environ["RAILWAY_VOLUME_MOUNT_PATH"], "recred.db")
+elif os.name == "nt":
+    DB_PATH = os.path.join(BASE_DIR, "recred.db")
+else:
+    DB_PATH = "/tmp/recred.db"
 SESSION_TTL = 24 * 3600   # 24 hours
+_db_initialized = False
+_db_init_lock = threading.Lock()
 
 # ===================== DATABASE =====================
+def ensure_db_dir():
+    if DB_PATH == ":memory:":
+        return
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(db_dir, exist_ok=True)
+
 def get_db():
+    ensure_db_dir()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    try:
+    global _db_initialized
+    if _db_initialized:
+        return
+
+    with _db_init_lock:
+        if _db_initialized:
+            return
+
         with get_db() as c:
             c.execute("""CREATE TABLE IF NOT EXISTS sessions(
                 token TEXT PRIMARY KEY,
@@ -49,11 +75,12 @@ def init_db():
                 claimed_offer TEXT
             )""")
             c.commit()
-        print(f"[DB] initialized at {DB_PATH}")
-    except Exception as e:
-        print(f"[DB] init error: {e}")
+        _db_initialized = True
+        app.logger.info("[DB] initialized at %s", DB_PATH)
 
-init_db()
+@app.before_request
+def initialize_database():
+    init_db()
 
 # ===================== OFFERS =====================
 OFFERS = [
